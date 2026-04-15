@@ -1,36 +1,33 @@
-# Multi-Container Runtime
+# OS-Jackfruit: Lightweight Multi-Container Runtime
 
-A lightweight Linux container runtime in C with a long-running supervisor and a kernel-space memory monitor.
+A practical Linux container runtime and kernel memory monitor written in C. This project demonstrates supervised container lifecycle management, isolated namespaces, bounded-buffer logging, and kernel-enforced memory limits.
 
-Read [`project-guide.md`](project-guide.md) for the full project specification.
+## Features
 
----
+- Supervisor-managed container runtime with CLI control
+- Concurrent container execution with isolated PID, UTS, and mount namespaces
+- Per-container log capture for `stdout` and `stderr`
+- Kernel module memory monitor with soft-limit warnings and hard-limit kills
+- Built-in workload programs for CPU, I/O, and memory experiments
+- Simple CLI: `supervisor`, `start`, `run`, `ps`, `logs`, `stop`
 
-## Getting Started
+## Tech Stack
 
-### 1. Fork the Repository
+- C for user-space runtime and workloads
+- Linux kernel module for memory monitoring
+- Shell scripting for environment checks
+- Makefile-based build system
 
-1. Go to [github.com/shivangjhalani/OS-Jackfruit](https://github.com/shivangjhalani/OS-Jackfruit)
-2. Click **Fork** (top-right)
-3. Clone your fork:
+## Prerequisites
 
-```bash
-git clone https://github.com/<your-username>/OS-Jackfruit.git
-cd OS-Jackfruit
-```
+- Ubuntu 22.04 or 24.04 VM
+- Secure Boot disabled
+- `sudo` privileges
+- `build-essential`
+- `linux-headers-$(uname -r)`
+- No WSL support
 
-### 2. Set Up Your VM
-
-You need an **Ubuntu 22.04 or 24.04** VM with **Secure Boot OFF**. WSL will not work.
-
-Install dependencies:
-
-```bash
-sudo apt update
-sudo apt install -y build-essential linux-headers-$(uname -r)
-```
-
-### 3. Run the Environment Check
+## Setup
 
 ```bash
 cd boilerplate
@@ -38,74 +35,172 @@ chmod +x environment-check.sh
 sudo ./environment-check.sh
 ```
 
-Fix any issues reported before moving on.
-
-### 4. Prepare the Root Filesystem
+Install required packages:
 
 ```bash
-mkdir rootfs-base
-wget https://dl-cdn.alpinelinux.org/alpine/v3.20/releases/x86_64/alpine-minirootfs-3.20.3-x86_64.tar.gz
-tar -xzf alpine-minirootfs-3.20.3-x86_64.tar.gz -C rootfs-base
-
-# Make one writable copy per container you plan to run
-cp -a ./rootfs-base ./rootfs-alpha
-cp -a ./rootfs-base ./rootfs-beta
+sudo apt update
+sudo apt install -y build-essential linux-headers-$(uname -r)
 ```
 
-Do not commit `rootfs-base/` or `rootfs-*` directories to your repository.
-
-### 5. Understand the Boilerplate
-
-The `boilerplate/` folder contains starter files:
-
-| File                   | Purpose                                             |
-| ---------------------- | --------------------------------------------------- |
-| `engine.c`             | User-space runtime and supervisor skeleton          |
-| `monitor.c`            | Kernel module skeleton                              |
-| `monitor_ioctl.h`      | Shared ioctl command definitions                    |
-| `Makefile`             | Build targets for both user-space and kernel module |
-| `cpu_hog.c`            | CPU-bound test workload                             |
-| `io_pulse.c`           | I/O-bound test workload                             |
-| `memory_hog.c`         | Memory-consuming test workload                      |
-| `environment-check.sh` | VM environment preflight check                      |
-
-Use these as your starting point. You are free to restructure the repository however you want — the submission requirements are listed in the project guide.
-
-### 6. Build and Verify
+## Build
 
 ```bash
 cd boilerplate
 make
 ```
 
-If this compiles without errors, your environment is ready.
-
-### 7. GitHub Actions Smoke Check
-
-Your fork will inherit a minimal GitHub Actions workflow from this repository.
-
-That workflow only performs CI-safe checks:
-
-- `make -C boilerplate ci`
-- user-space binary compilation (`engine`, `memory_hog`, `cpu_hog`, `io_pulse`)
-- `./boilerplate/engine` with no arguments must print usage and exit with a non-zero status
-
-The CI-safe build command is:
+Verify with the CI-safe target:
 
 ```bash
-make -C boilerplate ci
+make ci
 ```
 
-This smoke check does not test kernel-module loading, supervisor runtime behavior, or container execution.
+## Prepare the Root Filesystem
 
----
+Create the Alpine base root filesystem and per-container writable copies:
 
-## What to Do Next
+```bash
+mkdir rootfs-base
+wget https://dl-cdn.alpinelinux.org/alpine/v3.20/releases/x86_64/alpine-minirootfs-3.20.3-x86_64.tar.gz
+tar -xzf alpine-minirootfs-3.20.3-x86_64.tar.gz -C rootfs-base
+cp -a ./rootfs-base ./rootfs-alpha
+cp -a ./rootfs-base ./rootfs-beta
+```
 
-Read [`project-guide.md`](project-guide.md) end to end. It contains:
+> Use a unique writable rootfs directory for each running container.
 
-- The six implementation tasks (multi-container runtime, CLI, logging, kernel monitor, scheduling experiments, cleanup)
-- The engineering analysis you must write
-- The exact submission requirements, including what your `README.md` must contain (screenshots, analysis, design decisions)
+## Usage
 
-Your fork's `README.md` should be replaced with your own project documentation as described in the submission package section of the project guide. (As in get rid of all the above content and replace with your README.md)
+### Start the supervisor
+
+```bash
+cd boilerplate
+sudo ./engine supervisor ./rootfs-base
+```
+
+### Start a background container
+
+```bash
+sudo ./engine start c1 ./rootfs-alpha /memory_hog --soft-mib 40 --hard-mib 64 --nice 10
+```
+
+### Run a container in the foreground
+
+```bash
+sudo ./engine run c2 ./rootfs-beta /cpu_hog --nice 5
+```
+
+### List containers
+
+```bash
+sudo ./engine ps
+```
+
+### View container logs
+
+```bash
+sudo ./engine logs c1
+```
+
+### Stop a container
+
+```bash
+sudo ./engine stop c1
+```
+
+## Command Reference
+
+- `engine supervisor <base-rootfs>` — start the long-running supervisor
+- `engine start <id> <container-rootfs> <command> [--soft-mib N] [--hard-mib N] [--nice N]` — launch a background container
+- `engine run <id> <container-rootfs> <command> [--soft-mib N] [--hard-mib N] [--nice N]` — launch and wait for completion
+- `engine ps` — list container metadata and state
+- `engine logs <id>` — display logs for a container
+- `engine stop <id>` — request clean shutdown of a container
+
+## Architecture
+
+- `engine` runs as a supervisor daemon and CLI client
+- Supervisor manages container state, logging, and kernel monitor registration
+- Container output is captured through pipes and written to per-container log files
+- A bounded buffer preserves log data until it is safely flushed to disk
+- Kernel memory monitor tracks host PIDs and enforces soft/hard memory thresholds
+
+## Kernel Memory Monitoring
+
+The kernel module provides:
+
+- `/dev/container_monitor` control device
+- PID registration from supervisor via ioctl
+- periodic RSS tracking of monitored processes
+- soft-limit warning events
+- hard-limit termination with `SIGKILL`
+
+## Folder Structure
+
+- `boilerplate/`
+  - `engine.c` — user-space supervisor and CLI runtime
+  - `monitor.c` — kernel memory monitor module
+  - `monitor_ioctl.h` — ioctl interface shared between user space and kernel
+  - `cpu_hog.c` — CPU-bound workload
+  - `io_pulse.c` — I/O-bound workload
+  - `memory_hog.c` — memory allocation workload
+  - `environment-check.sh` — environment verification script
+  - `Makefile` — build and CI targets
+  - `logs/` — runtime log outputs
+- `screenshots/` — execution examples and output captures
+- `project-guide.md` — assignment requirements and grading guide
+
+## Demo Screenshots
+
+This demo uses all provided screenshots to cover the eight required task areas.
+
+1. **Multi-container supervision** — supervisor startup with multiple containers launched under one process.
+   ![Supervisor startup](screenshots/1.png)
+
+2. **Metadata tracking** — `engine ps` output showing tracked container IDs, states, and memory policy status.
+   ![Supervisor state output](screenshots/3.png)
+
+3. **Bounded-buffer logging** — captured log file output from the supervisor log pipeline.
+   ![Container logs](screenshots/5.png)
+
+4. **CLI and IPC** — a supervisor accepting a CLI request while running containers.
+   ![Supervisor accepting CLI command](screenshots/6.png)
+   ![CLI command and response](screenshots/2.png)
+
+5. **Soft-limit warning** — kernel monitor `dmesg` output reporting a soft memory threshold breach.
+   ![Soft limit warning](screenshots/8.png)
+
+6. **Hard-limit enforcement** — kernel monitor `dmesg` output showing containers killed after exceeding hard limits.
+   ![Hard limit kill events](screenshots/9.png)
+   ![Hard-limit kill evidence](screenshots/10.png)
+
+7. **Scheduling experiment** — CPU-bound workload output and timing measurement from the scheduler experiment.
+   ![CPU-bound scheduling experiment](screenshots/10.png)
+   ![Scheduling experiment measurement](screenshots/7.png)
+
+8. **Clean teardown** — process listings and defunct-check output showing no zombie processes after shutdown.
+   ![Supervisor and containers process list](screenshots/11.png)
+   ![No defunct processes](screenshots/12.png)
+
+Additional runtime and kernel monitor screenshots:
+
+- **Supervisor startup with CLI client** — `engine supervisor` accepting a new request while containers are active.
+  ![Supervisor accepting CLI command](screenshots/6.png)
+- **Kernel monitor warning details** — soft-limit messages for multiple container PIDs.
+  ![Kernel monitor warnings](screenshots/7.png)
+
+## Notes
+
+- `run` returns the final container exit status.
+- `stop` signals the supervisor to request a clean shutdown before terminating the process.
+- `ps` distinguishes `running`, `stopped`, `exited`, and `hard_limit_killed` states.
+- `memory_hog`, `cpu_hog`, and `io_pulse` are provided to validate enforcement and scheduling behavior.
+
+## Contribution
+
+Contributions should follow the existing C and shell conventions in `boilerplate/`, preserve supervisor and kernel monitor semantics, and keep logging behavior consistent.
+
+## License
+
+No license specified in this repository.
+
