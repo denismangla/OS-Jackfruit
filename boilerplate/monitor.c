@@ -1,270 +1,222 @@
-/*
- * monitor.c - Multi-Container Memory Monitor (Linux Kernel Module)
- *
- * Provided boilerplate:
- *   - device registration and teardown
- *   - timer setup
- *   - RSS helper
- *   - soft-limit and hard-limit event helpers
- *   - ioctl dispatch shell
- *
- * YOUR WORK: Fill in all sections marked // TODO.
- */
-
+#include <linux/module.h>
+#include <linux/kernel.h>
+#include <linux/init.h>
+#include <linux/fs.h>
 #include <linux/cdev.h>
 #include <linux/device.h>
-#include <linux/fs.h>
-#include <linux/kernel.h>
-#include <linux/list.h>
-#include <linux/mm.h>
-#include <linux/module.h>
-#include <linux/mutex.h>
-#include <linux/pid.h>
-#include <linux/sched/signal.h>
-#include <linux/slab.h>
-#include <linux/timer.h>
 #include <linux/uaccess.h>
-#include <linux/version.h>
+#include <linux/slab.h>
+#include <linux/list.h>
+#include <linux/mutex.h>
+#include <linux/timer.h>
+#include <linux/jiffies.h>
+#include <linux/sched.h>
+#include <linux/mm.h>
+#include <linux/signal.h>
+#include <linux/pid.h>
 
+/* pull in struct container_info + ioctl numbers */
 #include "monitor_ioctl.h"
 
-#define DEVICE_NAME "container_monitor"
-#define CHECK_INTERVAL_SEC 1
+MODULE_LICENSE("GPL");
+MODULE_AUTHOR("Student");
+MODULE_DESCRIPTION("Container memory monitor LKM");
 
-/* ==============================================================
- * TODO 1: Define your linked-list node struct.
- *
- * Requirements:
- *   - track PID, container ID, soft limit, and hard limit
- *   - remember whether the soft-limit warning was already emitted
- *   - include `struct list_head` linkage
- * ============================================================== */
+#define DEVICE_NAME  "container_monitor"
+#define CLASS_NAME   "container_mon"
+#define CHECK_INTERVAL_MS 2000   /* RSS check every 2 seconds */
 
+/* ===== PER-CONTAINER ENTRY ===== */
+struct mon_entry {
+    struct list_head list;
+    pid_t            pid;
+    int              soft_mib;
+    int              hard_mib;
+    char             id[64];
+    int              soft_warned;   /* have we already warned soft limit? */
+};
 
-/* ==============================================================
- * TODO 2: Declare the global monitored list and a lock.
- *
- * Requirements:
- *   - shared across ioctl and timer code paths
- *   - protect insert, remove, and iteration safely
- *
- * You may choose either a mutex or a spinlock, but your README must
- * justify the choice in terms of the code paths you implemented.
- * ============================================================== */
+static LIST_HEAD(g_entries);
+static DEFINE_MUTEX(g_list_lock);
 
+/* ===== DEVICE ===== */
+static int           g_major;
+static struct class  *g_class  = NULL;
+static struct device *g_device = NULL;
+static struct cdev    g_cdev;
+static dev_t          g_devno;
 
-/* --- Provided: internal device / timer state --- */
-static struct timer_list monitor_timer;
-static dev_t dev_num;
-static struct cdev c_dev;
-static struct class *cl;
+/* ===== TIMER ===== */
+static struct timer_list g_timer;
 
-/* ---------------------------------------------------------------
- * Provided: RSS Helper
- *
- * Returns the Resident Set Size in bytes for the given PID,
- * or -1 if the task no longer exists.
- * --------------------------------------------------------------- */
-static long get_rss_bytes(pid_t pid)
-{
+/* ===== RSS HELPER ===== */
+static long get_rss_mib(pid_t pid) {
     struct task_struct *task;
-    struct mm_struct *mm;
+    struct mm_struct   *mm;
     long rss_pages = 0;
 
     rcu_read_lock();
     task = pid_task(find_vpid(pid), PIDTYPE_PID);
-    if (!task) {
-        rcu_read_unlock();
-        return -1;
-    }
-    get_task_struct(task);
-    rcu_read_unlock();
+    if (!task) { rcu_read_unlock(); return -1; }
 
     mm = get_task_mm(task);
-    if (mm) {
-        rss_pages = get_mm_rss(mm);
-        mmput(mm);
-    }
-    put_task_struct(task);
-
-    return rss_pages * PAGE_SIZE;
-}
-
-/* ---------------------------------------------------------------
- * Provided: soft-limit helper
- *
- * Log a warning when a process exceeds the soft limit.
- * --------------------------------------------------------------- */
-static void log_soft_limit_event(const char *container_id,
-                                 pid_t pid,
-                                 unsigned long limit_bytes,
-                                 long rss_bytes)
-{
-    printk(KERN_WARNING
-           "[container_monitor] SOFT LIMIT container=%s pid=%d rss=%ld limit=%lu\n",
-           container_id, pid, rss_bytes, limit_bytes);
-}
-
-/* ---------------------------------------------------------------
- * Provided: hard-limit helper
- *
- * Kill a process when it exceeds the hard limit.
- * --------------------------------------------------------------- */
-static void kill_process(const char *container_id,
-                         pid_t pid,
-                         unsigned long limit_bytes,
-                         long rss_bytes)
-{
-    struct task_struct *task;
-
-    rcu_read_lock();
-    task = pid_task(find_vpid(pid), PIDTYPE_PID);
-    if (task)
-        send_sig(SIGKILL, task, 1);
     rcu_read_unlock();
 
-    printk(KERN_WARNING
-           "[container_monitor] HARD LIMIT container=%s pid=%d rss=%ld limit=%lu\n",
-           container_id, pid, rss_bytes, limit_bytes);
+    if (!mm) return 0;
+
+    rss_pages = get_mm_rss(mm);
+    mmput(mm);
+
+    return (rss_pages * PAGE_SIZE) >> 20;  /* bytes → MiB */
 }
 
-/* ---------------------------------------------------------------
- * Timer Callback - fires every CHECK_INTERVAL_SEC seconds.
- * --------------------------------------------------------------- */
-static void timer_callback(struct timer_list *t)
-{
-    /* ==============================================================
-     * TODO 3: Implement periodic monitoring.
-     *
-     * Requirements:
-     *   - iterate through tracked entries safely
-     *   - remove entries for exited processes
-     *   - emit soft-limit warning once per entry
-     *   - enforce hard limit and then remove the entry
-     *   - avoid use-after-free while deleting during iteration
-     * ============================================================== */
+/* ===== TIMER CALLBACK — periodic RSS check ===== */
+static void check_memory(struct timer_list *t) {
+    struct mon_entry *entry, *tmp;
 
-    mod_timer(&monitor_timer, jiffies + CHECK_INTERVAL_SEC * HZ);
+    mutex_lock(&g_list_lock);
+    list_for_each_entry_safe(entry, tmp, &g_entries, list) {
+        long rss = get_rss_mib(entry->pid);
+
+        if (rss < 0) {
+            /* process gone — remove stale entry */
+            pr_info("container_monitor: pid %d gone, removing\n", entry->pid);
+            list_del(&entry->list);
+            kfree(entry);
+            continue;
+        }
+
+        if (rss >= entry->hard_mib) {
+            pr_warn("container_monitor: [%s] pid=%d RSS=%ldMiB >= hard=%dMiB — KILLING\n",
+                    entry->id, entry->pid, rss, entry->hard_mib);
+            kill_pid(find_vpid(entry->pid), SIGKILL, 1);
+            /* entry will be removed on next tick once pid is gone */
+        } else if (rss >= entry->soft_mib && !entry->soft_warned) {
+            pr_warn("container_monitor: [%s] pid=%d RSS=%ldMiB >= soft=%dMiB — WARNING\n",
+                    entry->id, entry->pid, rss, entry->soft_mib);
+            entry->soft_warned = 1;
+        }
+    }
+    mutex_unlock(&g_list_lock);
+
+    /* re-arm */
+    mod_timer(&g_timer, jiffies + msecs_to_jiffies(CHECK_INTERVAL_MS));
 }
 
-/* ---------------------------------------------------------------
- * IOCTL Handler
- *
- * Supported operations:
- *   - register a PID with soft + hard limits
- *   - unregister a PID when the runtime no longer needs tracking
- * --------------------------------------------------------------- */
-static long monitor_ioctl(struct file *f, unsigned int cmd, unsigned long arg)
-{
-    struct monitor_request req;
+/* ===== IOCTL ===== */
+static long mon_ioctl(struct file *file, unsigned int cmd, unsigned long arg) {
+    switch (cmd) {
 
-    (void)f;
+    case MONITOR_REGISTER: {
+        struct container_info info;
+        if (copy_from_user(&info, (void __user *)arg, sizeof(info)))
+            return -EFAULT;
 
-    if (cmd != MONITOR_REGISTER && cmd != MONITOR_UNREGISTER)
-        return -EINVAL;
+        struct mon_entry *entry = kmalloc(sizeof(*entry), GFP_KERNEL);
+        if (!entry) return -ENOMEM;
 
-    if (copy_from_user(&req, (struct monitor_request __user *)arg, sizeof(req)))
-        return -EFAULT;
+        entry->pid         = info.pid;
+        entry->soft_mib    = info.soft_mib;
+        entry->hard_mib    = info.hard_mib;
+        entry->soft_warned = 0;
+        strncpy(entry->id, info.id, sizeof(entry->id) - 1);
+        entry->id[sizeof(entry->id) - 1] = '\0';
 
-    if (cmd == MONITOR_REGISTER) {
-        printk(KERN_INFO
-               "[container_monitor] Registering container=%s pid=%d soft=%lu hard=%lu\n",
-               req.container_id, req.pid, req.soft_limit_bytes, req.hard_limit_bytes);
+        mutex_lock(&g_list_lock);
+        list_add(&entry->list, &g_entries);
+        mutex_unlock(&g_list_lock);
 
-        /* ==============================================================
-         * TODO 4: Add a monitored entry.
-         *
-         * Requirements:
-         *   - allocate and initialize one node from req
-         *   - validate allocation and limits
-         *   - insert into the shared list under the chosen lock
-         * ============================================================== */
-
+        pr_info("container_monitor: registered [%s] pid=%d soft=%dMiB hard=%dMiB\n",
+                entry->id, entry->pid, entry->soft_mib, entry->hard_mib);
         return 0;
     }
 
-    printk(KERN_INFO
-           "[container_monitor] Unregister request container=%s pid=%d\n",
-           req.container_id, req.pid);
+    case MONITOR_UNREGISTER: {
+        int pid;
+        if (copy_from_user(&pid, (void __user *)arg, sizeof(pid)))
+            return -EFAULT;
 
-    /* ==============================================================
-     * TODO 5: Remove a monitored entry on explicit unregister.
-     *
-     * Requirements:
-     *   - search by PID, container ID, or both
-     *   - remove the matching entry safely if found
-     *   - return status indicating whether a matching entry was removed
-     * ============================================================== */
+        mutex_lock(&g_list_lock);
+        struct mon_entry *entry, *tmp;
+        list_for_each_entry_safe(entry, tmp, &g_entries, list) {
+            if (entry->pid == pid) {
+                list_del(&entry->list);
+                kfree(entry);
+                pr_info("container_monitor: unregistered pid=%d\n", pid);
+                break;
+            }
+        }
+        mutex_unlock(&g_list_lock);
+        return 0;
+    }
 
-    return -ENOENT;
+    default:
+        return -EINVAL;
+    }
 }
 
-/* --- Provided: file operations --- */
-static struct file_operations fops = {
-    .owner = THIS_MODULE,
-    .unlocked_ioctl = monitor_ioctl,
+/* ===== FILE OPS ===== */
+static int mon_open(struct inode *inode, struct file *file) { return 0; }
+static int mon_release(struct inode *inode, struct file *file) { return 0; }
+
+static const struct file_operations g_fops = {
+    .owner          = THIS_MODULE,
+    .open           = mon_open,
+    .release        = mon_release,
+    .unlocked_ioctl = mon_ioctl,
 };
 
-/* --- Provided: Module Init --- */
-static int __init monitor_init(void)
-{
-    if (alloc_chrdev_region(&dev_num, 0, 1, DEVICE_NAME) < 0)
-        return -1;
+/* ===== MODULE INIT / EXIT ===== */
+static int __init mon_init(void) {
+    int ret;
 
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 4, 0)
-    cl = class_create(DEVICE_NAME);
-#else
-    cl = class_create(THIS_MODULE, DEVICE_NAME);
-#endif
-    if (IS_ERR(cl)) {
-        unregister_chrdev_region(dev_num, 1);
-        return PTR_ERR(cl);
+    ret = alloc_chrdev_region(&g_devno, 0, 1, DEVICE_NAME);
+    if (ret < 0) { pr_err("container_monitor: alloc_chrdev_region failed\n"); return ret; }
+    g_major = MAJOR(g_devno);
+
+    cdev_init(&g_cdev, &g_fops);
+    ret = cdev_add(&g_cdev, g_devno, 1);
+    if (ret < 0) { unregister_chrdev_region(g_devno, 1); return ret; }
+
+    g_class = class_create(CLASS_NAME);
+    if (IS_ERR(g_class)) {
+        cdev_del(&g_cdev); unregister_chrdev_region(g_devno, 1);
+        return PTR_ERR(g_class);
     }
 
-    if (IS_ERR(device_create(cl, NULL, dev_num, NULL, DEVICE_NAME))) {
-        class_destroy(cl);
-        unregister_chrdev_region(dev_num, 1);
-        return -1;
+    g_device = device_create(g_class, NULL, g_devno, NULL, DEVICE_NAME);
+    if (IS_ERR(g_device)) {
+        class_destroy(g_class); cdev_del(&g_cdev); unregister_chrdev_region(g_devno, 1);
+        return PTR_ERR(g_device);
     }
 
-    cdev_init(&c_dev, &fops);
-    if (cdev_add(&c_dev, dev_num, 1) < 0) {
-        device_destroy(cl, dev_num);
-        class_destroy(cl);
-        unregister_chrdev_region(dev_num, 1);
-        return -1;
-    }
+    /* start periodic timer */
+    timer_setup(&g_timer, check_memory, 0);
+    mod_timer(&g_timer, jiffies + msecs_to_jiffies(CHECK_INTERVAL_MS));
 
-    timer_setup(&monitor_timer, timer_callback, 0);
-    mod_timer(&monitor_timer, jiffies + CHECK_INTERVAL_SEC * HZ);
-
-    printk(KERN_INFO "[container_monitor] Module loaded. Device: /dev/%s\n", DEVICE_NAME);
+    pr_info("container_monitor: loaded, device /dev/%s major=%d\n", DEVICE_NAME, g_major);
     return 0;
 }
 
-/* --- Provided: Module Exit --- */
-static void __exit monitor_exit(void)
-{
-    del_timer_sync(&monitor_timer);
+static void __exit mon_exit(void) {
+    del_timer_sync(&g_timer);
 
-    /* ==============================================================
-     * TODO 6: Free all remaining monitored entries.
-     *
-     * Requirements:
-     *   - remove and free every list node safely
-     *   - leave no leaked state on module unload
-     * ============================================================== */
+    /* free all list entries */
+    mutex_lock(&g_list_lock);
+    struct mon_entry *entry, *tmp;
+    list_for_each_entry_safe(entry, tmp, &g_entries, list) {
+        list_del(&entry->list);
+        kfree(entry);
+    }
+    mutex_unlock(&g_list_lock);
 
-    cdev_del(&c_dev);
-    device_destroy(cl, dev_num);
-    class_destroy(cl);
-    unregister_chrdev_region(dev_num, 1);
+    device_destroy(g_class, g_devno);
+    class_destroy(g_class);
+    cdev_del(&g_cdev);
+    unregister_chrdev_region(g_devno, 1);
 
-    printk(KERN_INFO "[container_monitor] Module unloaded.\n");
+    pr_info("container_monitor: unloaded\n");
 }
 
-module_init(monitor_init);
-module_exit(monitor_exit);
-
-MODULE_LICENSE("GPL");
-MODULE_DESCRIPTION("Supervised multi-container memory monitor");
+module_init(mon_init);
+module_exit(mon_exit);
