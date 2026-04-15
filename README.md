@@ -156,38 +156,31 @@ This demo uses all provided screenshots to cover the eight required task areas.
 
 1. **Multi-container supervision** — supervisor startup with multiple containers launched under one process.
    ![Supervisor startup](screenshots/1.png)
+   ![Running multiple containers](screenshots/2.png)
 
 2. **Metadata tracking** — `engine ps` output showing tracked container IDs, states, and memory policy status.
    ![Supervisor state output](screenshots/3.png)
 
 3. **Bounded-buffer logging** — captured log file output from the supervisor log pipeline.
-   ![Container logs](screenshots/5.png)
+   ![Container logs](screenshots/4.png)
 
 4. **CLI and IPC** — a supervisor accepting a CLI request while running containers.
+   ![CLI command and response](screenshots/5.png)
    ![Supervisor accepting CLI command](screenshots/6.png)
-   ![CLI command and response](screenshots/2.png)
 
 5. **Soft-limit warning** — kernel monitor `dmesg` output reporting a soft memory threshold breach.
-   ![Soft limit warning](screenshots/8.png)
+   ![Soft limit warning](screenshots/7.png)
 
 6. **Hard-limit enforcement** — kernel monitor `dmesg` output showing containers killed after exceeding hard limits.
-   ![Hard limit kill events](screenshots/9.png)
-   ![Hard-limit kill evidence](screenshots/10.png)
+   ![Hard limit kill events](screenshots/8.png)
 
 7. **Scheduling experiment** — CPU-bound workload output and timing measurement from the scheduler experiment.
-   ![CPU-bound scheduling experiment](screenshots/10.png)
-   ![Scheduling experiment measurement](screenshots/7.png)
+   ![CPU-bound scheduling experiment](screenshots/9.png)(screenshots/10.png)
 
 8. **Clean teardown** — process listings and defunct-check output showing no zombie processes after shutdown.
-   ![Supervisor and containers process list](screenshots/11.png)
-   ![No defunct processes](screenshots/12.png)
+   ![No defunct processes](screenshots/11.png)
+   ![Supervisor and containers process list](screenshots/12.png)
 
-Additional runtime and kernel monitor screenshots:
-
-- **Supervisor startup with CLI client** — `engine supervisor` accepting a new request while containers are active.
-  ![Supervisor accepting CLI command](screenshots/6.png)
-- **Kernel monitor warning details** — soft-limit messages for multiple container PIDs.
-  ![Kernel monitor warnings](screenshots/7.png)
 
 ## Notes
 
