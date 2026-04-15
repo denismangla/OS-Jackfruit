@@ -175,7 +175,8 @@ This demo uses all provided screenshots to cover the eight required task areas.
    ![Hard limit kill events](screenshots/8.png)
 
 7. **Scheduling experiment** — CPU-bound workload output and timing measurement from the scheduler experiment.
-   ![CPU-bound scheduling experiment](screenshots/9.png)(screenshots/10.png)
+   ![CPU-bound scheduling experiment](screenshots/9.png)
+   ![CPU-bound scheduling experiment](screenshots/10.png)
 
 8. **Clean teardown** — process listings and defunct-check output showing no zombie processes after shutdown.
    ![No defunct processes](screenshots/11.png)
